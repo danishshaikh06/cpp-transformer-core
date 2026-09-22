@@ -95,16 +95,10 @@ logs/
 *.temp
 tmp/
 
-# Project artifacts and local datasets
+# Local data and generated training artifacts
 artifacts/
-dataset/
-main/tokenizer/code_alpaca_20k.json
-main/tokenizer/CodeFeedback-Filtered-Instruction.json
-main/tokenizer/cpp_dataset.txt
-main/tokenizer/cpp_dataset_clean.txt
-main/tokenizer/cleaned_c++_data.json
-main/tokenizer/cleaned_c++_v2data.json
-main/tokenizer/cpp_instruction_dataset.txt
-main/tokenizer/cpp_instruction_dataset_v2.txt
-main/tokenizer/fine_tuning_dataset.txt
-main/tokenizer/Cpp Llm Project Readme.pdf
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+third_party/
