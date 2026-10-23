@@ -8,6 +8,13 @@ version = "0.1.0"
 description = "From-scratch decoder-only transformer training pipeline for C++ source code."
 readme = "readme.md"
 requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "safetensors>=0.8.0",
+    "torch==2.8.0",
+    "tqdm>=4.70.1",
+    "transformers==4.56.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -26,3 +33,12 @@ select = ["E", "F", "I"]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
