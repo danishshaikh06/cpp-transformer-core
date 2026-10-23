@@ -1,4 +1,4 @@
-# From-Scratch C++ Transformer Training Project
+# C++ Transformer & Custom Tokenizer Engine
 
 This repository contains a from-scratch decoder-only transformer training pipeline
 specialized for C/C++ source code, with a primary focus on C++. The corpus builder collects C/C++ files, the data
