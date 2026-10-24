@@ -15,7 +15,7 @@ from cpp_transformer.core.paths import (
     TRAINING_CONFIG_FILE,
     ensure_artifacts_dir,
 )
-from cpp_transformer.models.decoder_only import build_transformer
+from cpp_transformer.models.educational_decoder import build_transformer
 from cpp_transformer.training.inference import generate_completion, load_tokenizer
 
 
@@ -193,6 +193,7 @@ def main():
         "heads": runtime_config["heads"],
         "dropout": runtime_config["dropout"],
         "d_ff": runtime_config["d_ff"],
+        "kv_heads": runtime_config.get("kv_heads"),
         "vocab_size": vocab_size,
         "pad_id": pad_id,
         "bos_id": bos_id,
@@ -242,6 +243,7 @@ def main():
         h=runtime_config["heads"],
         dropout=runtime_config["dropout"],
         d_ff=runtime_config["d_ff"],
+        kv_heads=runtime_config.get("kv_heads"),
     ).to(DEVICE)
 
     print("Model parameters:", sum(p.numel() for p in model.parameters()))

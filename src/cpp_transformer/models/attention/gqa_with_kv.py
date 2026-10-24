@@ -152,24 +152,33 @@ class GroupedQueryAttention(nn.Module):
 
             if mask.shape[-2:] != (Tq, Tk):
                 raise ValueError("Incorrect attention mask shape")
-
+            
+            # case A: 2D mask
             if mask.ndim == 2:
                 mask = mask[None, None, None, :, :]
 
-            elif (
-                mask.ndim == 4
-                and mask.shape[0] == B
-                and mask.shape[1] == 1
-            ):
-                mask = mask.unsqueeze(2)
+             # Cases B and C: 4D mask
+            elif mask.ndim == 4:
 
-            elif (
-                mask.ndim == 4
-                and mask.shape[:2] == (B, self.h)
-            ):
-                mask = mask.reshape(
-                    B, self.kv_heads, self.group_size, Tq, Tk
-                )
+                if mask.shape[0] not in (1, B):
+                    raise ValueError("Incorrect mask batch dimension")
+
+                # Case B: one shared attention head
+                if mask.shape[1] == 1:
+                    mask = mask.unsqueeze(2)
+
+                # Case C: one mask per query head
+                elif mask.shape[1] == self.h:
+                    mask = mask.reshape(
+                        mask.shape[0],
+                        self.kv_heads,
+                        self.group_size,
+                        Tq,
+                        Tk,
+                    )
+
+                else:
+                    raise ValueError("Unsupported mask head dimension")
 
             else:
                 raise ValueError("Unsupported mask dimensions")
@@ -180,17 +189,17 @@ class GroupedQueryAttention(nn.Module):
             ~allowed, float("-inf")
         )
 
-        # 7. Numerically stable softmax
+        # Numerically stable softmax
         weights = torch.softmax(
             scores.float(), dim=-1
         ).to(query.dtype)
 
         weights = self.dropout(weights)
 
-        # 8. Attention output
-        output = weights @ value.unsqueeze(2)
+        # Attention output
+        output = weights @ value.unsqueeze(2) 
 
-        # 9. Merge query groups into heads
+        # Merge query groups into heads
         output = output.reshape(
             B, self.h, Tq, self.d_k
         )

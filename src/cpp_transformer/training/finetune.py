@@ -14,7 +14,7 @@ from cpp_transformer.core.paths import (
     PROCESSED_DATA_DIR,
     TRAINING_CONFIG_FILE,
 )
-from cpp_transformer.models.decoder_only import build_transformer
+from cpp_transformer.models.educational_decoder import build_transformer
 from cpp_transformer.training.inference import generate_completion, load_tokenizer
 
 
