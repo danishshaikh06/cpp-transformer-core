@@ -1,6 +1,7 @@
 import torch 
 from torch import nn
 import math
+from cpp_transformer.models.attention.gqa_with_kv import GroupedQueryAttention
 
 
 class InputEmbedding(nn.Module):
