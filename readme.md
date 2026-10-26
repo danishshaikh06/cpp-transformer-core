@@ -40,8 +40,6 @@ are deliberately excluded from version control.
 3. **block size**: number of tokens inside a block
 4. **page size**: the physical memory size of a block, defined as:
 
-4. **page size**: the physical memory size of a block, defined as:
-
 ```
     page_size = num_layers * block_size * kv_hidden_size
 ```
