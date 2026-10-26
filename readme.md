@@ -41,14 +41,14 @@ are deliberately excluded from version control.
 4. **page size**: the physical memory size of a block, defined as:
 
     ```
-    page_size = num_layers * block_size * kv_hidden_size
+    page\_size = num_layers * block_size * kv_hidden_size
     ```
 
     `num_layers` doesn't mean the total number of layers in the model. The exact number depends on the context in this doc.
 
     !!! note
         This is different from `KVCacheSpec.page_size_bytes` in the code, which is defined as:
-        
+
         ```
-        page_size_bytes = block_size * kv_hidden_size
+        page\_size\_bytes = block\_size * kv_hidden_size
         ```
