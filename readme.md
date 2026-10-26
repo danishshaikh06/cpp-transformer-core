@@ -49,6 +49,6 @@ are deliberately excluded from version control.
     !!! note
         This is different from `KVCacheSpec.page_size_bytes` in the code, which is defined as:
 
-        ```
+        
         page_size_bytes = block_size * kv_hidden_size
-        ```
+        
