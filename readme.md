@@ -31,3 +31,17 @@ python -m cpp_transformer.training.train
 Training settings and special-token IDs are versioned in
 [`configs/training.json`](configs/training.json). Generated datasets and checkpoints
 are deliberately excluded from version control.
+
+
+$$
+    \text{num\_layers} \times \text{block\_size} \times \text{kv\_hidden\_size}
+    $$
+
+    `num_layers` doesn't mean the total number of layers in the model. The exact number depends on the context in this doc.
+
+    !!! note
+        This is different from `KVCacheSpec.page_size_bytes` in the code, which is defined as:
+
+        $$
+        \text{block\_size} \times \text{kv\_hidden\_size}
+        $$
