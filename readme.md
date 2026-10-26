@@ -53,11 +53,6 @@ are deliberately excluded from version control.
         page_size_bytes = block_size * kv_hidden_size
     ```
 
-
 $$
-\mathrm{num\_layers} \times \mathrm{block\_size} \times \mathrm{kv\_hidden\_size}
-$$
-
-$$
-\text{num\\_layers} \times \text{block\\_size} \times \text{kv\\_hidden\\_size}
+\mathrm{page\_size} = \mathrm{block\_size} \times \mathrm{num\_hidden\_layers} \times \mathrm{kv\_hidden\_size}
 $$
