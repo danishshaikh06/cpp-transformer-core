@@ -54,6 +54,10 @@ are deliberately excluded from version control.
     ```
 
 
-```
-page_size = block_size * num_hidden_layers * kv_hidden_size
-```
+$$
+\mathrm{num\_layers} \times \mathrm{block\_size} \times \mathrm{kv\_hidden\_size}
+$$
+
+$$
+\text{num\\_layers} \times \text{block\\_size} \times \text{kv\\_hidden\\_size}
+$$
