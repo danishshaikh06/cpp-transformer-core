@@ -1,219 +1,384 @@
 
+from __future__ import annotations
+
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+from transformers.cache_utils import Cache, DynamicCache
+
+from configs.attention import AttentionConfig
 
 
 class GroupedQueryAttention(nn.Module):
     """
-    Causal Grouped Query Attention with optional KV caching.
+    Causal Grouped Query Attention.
 
-    kv_heads == h : MHA
-    kv_heads == 1 : MQA
-    otherwise     : GQA
+    Supports:
+        - MHA, GQA and MQA
+        - Reference and SDPA backends
+        - DynamicCache during inference
+        - Boolean attention masks
+        - Training-time dropout
+
+    The caller owns the KV cache.
+    No cache is stored as mutable model state.
     """
 
     def __init__(
         self,
-        d_model: int,
-        h: int,
-        kv_heads: int,
-        dropout: float = 0.0,
-    ):
+        config: AttentionConfig,
+        *,
+        layer_idx: int,
+    ) -> None:
         super().__init__()
 
-        if d_model <= 0 or h <= 0 or kv_heads <= 0:
-            raise ValueError("Dimensions must be positive")
+        if (
+            isinstance(layer_idx, bool)
+            or not isinstance(layer_idx, int)
+            or layer_idx < 0
+        ):
+            raise ValueError(
+                "layer_idx must be a nonnegative integer"
+            )
 
-        if d_model % h != 0:
-            raise ValueError("d_model must be divisible by h")
+        self.config = config
+        self.layer_idx = layer_idx
 
-        if h % kv_heads != 0:
-            raise ValueError("h must be divisible by kv_heads")
+        d = config.d_model
+        kv_dim = config.num_key_value_heads * config.head_dim
 
-        self.h = h
-        self.kv_heads = kv_heads
-        self.group_size = h // kv_heads
-        self.d_k = d_model // h
-
-        kv_dim = kv_heads * self.d_k
-
-        # Independent query heads
-        self.w_q = nn.Linear(d_model, d_model, bias=False)
-
-        # Shared key/value heads
-        self.w_k = nn.Linear(d_model, kv_dim, bias=False)
-        self.w_v = nn.Linear(d_model, kv_dim, bias=False)
-
-        self.W_o = nn.Linear(d_model, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.q_proj = nn.Linear(d, d, bias=False)
+        self.k_proj = nn.Linear(d, kv_dim, bias=False)
+        self.v_proj = nn.Linear(d, kv_dim, bias=False)
+        self.o_proj = nn.Linear(d, d, bias=False)
 
     def forward(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: torch.Tensor | None = None,
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        hidden_states: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         use_cache: bool = False,
-    ):
+    ) -> torch.Tensor:
         """
-        Causal self-attention.
+        Args:
+            hidden_states:
+                (batch, new_tokens, d_model)
 
-        Input Q/K/V: (B, Tnew, D)
+            attention_mask:
+                Boolean key-padding mask (B, total_kv_tokens),
+                or explicit 4D attention mask.
+                True means attention is allowed.
 
-        Cached K/V:
-            (B, Hkv, Tpast, d)
+            past_key_values:
+                Request-owned DynamicCache.
 
-        Output:
-            (B, Tnew, D)
+            cache_position:
+                Absolute positions of the incoming tokens.
+                Must be consecutive and consistent with cache.
 
-        If use_cache=True, also return updated K/V.
+            use_cache:
+                Whether to update the supplied cache.
+
+        Returns:
+            Attention output: (B, new_tokens, d_model)
+
+        Note:
+            The supplied cache is mutated in place.
         """
 
-        if q.ndim != 3 or q.shape != k.shape or k.shape != v.shape:
-            raise ValueError("Expected matching (B, Tnew, D) inputs")
+        # Input Validation
+        if (
+            hidden_states.ndim != 3
+            or hidden_states.shape[-1] != self.config.d_model
+        ):
+            raise ValueError(
+                "hidden_states must have shape "
+                "(batch, tokens, d_model)"
+            )
 
-        B, Tq, _ = q.shape
+        if not hidden_states.is_floating_point():
+            raise TypeError(
+                "hidden_states must be floating point"
+            )
 
-        query = self.w_q(q) # (B, T, D)
-        key = self.w_k(k)   # (B,T,kv_dim)
-        value = self.w_v(v) # (B,T,kv_dim)
+        batch, q_len, _ = hidden_states.shape
 
-        #Split into heads
+        if batch == 0 or q_len == 0:
+            raise ValueError(
+                "Empty batches or sequences are unsupported"
+            )
+
+        if use_cache and past_key_values is None:
+            raise ValueError(
+                "Pass a request-owned DynamicCache "
+                "when use_cache=True"
+            )
+
+        if past_key_values is not None and not use_cache:
+            raise ValueError(
+                "past_key_values supplied with use_cache=False"
+            )
+
+        if (
+            past_key_values is not None
+            and not isinstance(past_key_values, DynamicCache)
+        ):
+            raise NotImplementedError(
+                "Only DynamicCache is supported "
+                "in this implementation"
+            )
+
+        # Cache positions
+        past_len = (
+            past_key_values.get_seq_length(self.layer_idx)
+            if past_key_values is not None
+            else 0
+        )
+
+        kv_len = past_len + q_len
+
+        if cache_position is not None:
+            if (
+                cache_position.ndim != 1
+                or cache_position.numel() != q_len
+                or cache_position.dtype != torch.long
+                or cache_position.device != hidden_states.device
+            ):
+                raise ValueError(
+                    "cache_position must be a LongTensor "
+                    "of shape (tokens,) on the input device"
+                )
+        else:
+            cache_position = torch.arange(
+                past_len,
+                kv_len,
+                device=hidden_states.device,
+                dtype=torch.long,
+            )
+
+        expected_positions = torch.arange(
+            past_len,
+            kv_len,
+            device=hidden_states.device,
+            dtype=torch.long,
+        )
+
+        if not torch.equal(cache_position, expected_positions):
+            raise ValueError(
+                "cache_position must match the next contiguous cache positions"
+            )
+
+        # Validate masks before cache mutation
+        if attention_mask is not None:
+
+            if (
+                attention_mask.dtype != torch.bool
+                or attention_mask.device != hidden_states.device
+            ):
+                raise ValueError(
+                    "attention_mask must be boolean "
+                    "and on the input device"
+                )
+
+            allowed_shapes = (
+                (batch, kv_len),
+                (batch, 1, q_len, kv_len), 
+                (
+                    batch,
+                    self.config.num_attention_heads,
+                    q_len,
+                    kv_len,
+                ),
+            )
+
+            if tuple(attention_mask.shape) not in allowed_shapes:
+                raise ValueError(
+                    "Expected a 2D key-padding or 4D "
+                    "query/key mask, got "
+                    f"{tuple(attention_mask.shape)}"
+                )
+
+        Hq = self.config.num_attention_heads
+        Hkv = self.config.num_key_value_heads
+        d = self.config.head_dim
+
+        # Q, K, V projections
+        query = self.q_proj(hidden_states) # (B, T, D)
+        key = self.k_proj(hidden_states)   # (B,T,kv_dim)
+        value = self.v_proj(hidden_states) # (B,T,kv_dim)
+
+        # (B, Hq, Tq, d)
         query = query.reshape(
-            B, Tq, self.h, self.d_k
+            batch, q_len, Hq, d
         ).transpose(1, 2)
 
+        # (B, Hkv, Tq, d)
         key = key.reshape(
-            B, Tq, self.kv_heads, self.d_k
+            batch, q_len, Hkv, d
         ).transpose(1, 2)
 
         value = value.reshape(
-            B, Tq, self.kv_heads, self.d_k
+            batch, q_len, Hkv, d
         ).transpose(1, 2)
 
-        # Append previously cached K/V
-        past_len = 0
+        # KV cache update
+        if past_key_values is not None:
+            key, value = past_key_values.update(
+                key,
+                value,
+                layer_idx=self.layer_idx,
+                cache_kwargs={
+                    "cache_position": cache_position
+                },
+            )
 
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
-
-            if (
-                past_k.shape != past_v.shape
-                or past_k.shape[:2] != (B, self.kv_heads)
-                or past_k.shape[-1] != self.d_k
-            ):
-                raise ValueError("Invalid cached K/V dimensions")
-
-            past_len = past_k.shape[-2]
-
-            key = torch.cat((past_k, key), dim=-2)
-            value = torch.cat((past_v, value), dim=-2)
-
-        Tk = key.shape[-2]
-
-        # Group query heads
-        # (B, Hkv, groups, Tq, d)
-        query = query.reshape(
-            B,
-            self.kv_heads,
-            self.group_size,
-            Tq,
-            self.d_k,
+        # Attention mask
+        # PyTorch's non-square is_causal alignment
+        # is not suitable for cached decode path.
+        square_fast_path = (
+            past_len == 0
+            and attention_mask is None
         )
 
-        # Shared KV attention scores
-        # (B, Hkv, groups, Tq, Tk)
-        scores = (
-            query @ key.unsqueeze(2).transpose(-2, -1) # the unsqueeze(2) is used for broadcasting to match the shape of query  
-        ) / math.sqrt(self.d_k)
+        if square_fast_path:
+            mask = None
+        else:
+            key_positions = torch.arange(
+                key.shape[-2],
+                device=hidden_states.device,
+            )
 
-        # Causal mask accounting for past tokens
-        q_positions = past_len + torch.arange(
-            Tq, device=q.device
-        )
+            # Query i attends to keys at positions <= i.
+            mask = (
+                key_positions[None, :]
+                <= cache_position[:, None] # -> this results in shape [Tq,Tk]
+            )[None, None, :, :] # (B, Tq, Hq, Tk)
 
-        k_positions = torch.arange(
-            Tk, device=q.device
-        )
+            if attention_mask is not None:
+                if attention_mask.ndim == 2:
+                    attention_mask = attention_mask[
+                        :, None, None, :
+                    ]
 
-        # broadcasting adds extra dimension 
-        allowed = (
-            k_positions[None, :] <= q_positions[:, None] # -> this results in shape [Tq,Tk]
-        )[None, None, None, :, :] # -> this results in shape (B, H, Tq, Tk)
+                mask = mask & attention_mask
 
-        # Optional padding / external attention mask
-        if mask is not None:
+        # SDPA backend 
+        if self.config.backend == "sdpa":
 
-            if mask.dtype != torch.bool:
-                raise ValueError("Attention mask must be boolean")
+            # Native GQA acceleration is intended for CUDA.
+            # Keep a portable non-CUDA fallback.
 
-            if mask.shape[-2:] != (Tq, Tk):
-                raise ValueError("Incorrect attention mask shape")
+            if Hq % Hkv != 0:
+                raise ValueError("Hq must be divisible by Hkv")
+
+            if self.config.group_size != Hq // Hkv:
+                raise ValueError("Incorrect GQA group_size")
             
-            # case A: 2D mask
-            if mask.ndim == 2:
-                mask = mask[None, None, None, :, :]
+            native_gqa = Hq != Hkv and query.is_cuda
 
-             # Cases B and C: 4D mask
-            elif mask.ndim == 4:
+            if Hq != Hkv and not native_gqa:
+                group = self.config.group_size
 
-                if mask.shape[0] not in (1, B):
-                    raise ValueError("Incorrect mask batch dimension")
+                #key heads:   [K0, K0, K1, K1] ---> example if query group is 2 
+                #value heads: [V0, V0, V1, V1]
+                key = key.repeat_interleave(
+                    group, dim=1
+                )
 
-                # Case B: one shared attention head
-                if mask.shape[1] == 1:
-                    mask = mask.unsqueeze(2)
+                value = value.repeat_interleave(
+                    group, dim=1
+                )
 
-                # Case C: one mask per query head
-                elif mask.shape[1] == self.h:
-                    mask = mask.reshape(
-                        mask.shape[0],
-                        self.kv_heads,
-                        self.group_size,
-                        Tq,
-                        Tk,
-                    )
+            context = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask,
+                is_causal=square_fast_path,
+                dropout_p=(
+                    float(self.config.dropout)
+                    if self.training
+                    else 0.0
+                ),
+                enable_gqa=native_gqa,
+            )
 
-                else:
-                    raise ValueError("Unsupported mask head dimension")
+            if mask is not None:
+                # Fully masked query rows produce zero output.
+                valid = mask.any(
+                    dim=-1, keepdim=True
+                )
 
-            else:
-                raise ValueError("Unsupported mask dimensions")
+                context = torch.where(
+                    valid, context, 0.0
+                )
 
-            allowed = allowed & mask
+        # Reference backend 
+        else:
+            # Explicit repetition for numerical verification.
+            # Not intended as the optimized GPU path.
+            group = self.config.group_size
 
-        scores = scores.masked_fill(
-            ~allowed, float("-inf")
+            expanded_k = key.repeat_interleave(
+                group, dim=1
+            )
+
+            expanded_v = value.repeat_interleave(
+                group, dim=1
+            )
+
+            scores = (
+                query @ expanded_k.transpose(-2, -1)
+            ) / math.sqrt(d)
+
+            if square_fast_path:
+                causal = torch.ones(
+                    q_len,
+                    q_len,
+                    dtype=torch.bool,
+                    device=query.device,
+                ).tril()
+
+                mask = causal[None, None, :, :]
+
+            # Compute softmax in FP32.
+            scores = scores.float().masked_fill(
+                ~mask,
+                torch.finfo(torch.float32).min,
+            )
+
+            weights = torch.softmax(
+                scores, dim=-1
+            )
+
+            # Ensure fully masked rows contribute zero.
+            weights = torch.where(
+                mask.any(dim=-1, keepdim=True),
+                weights,
+                0.0,
+            )
+
+            weights = F.dropout(
+                weights,
+                p=float(self.config.dropout),
+                training=self.training,
+            )
+
+            context = (
+                weights.to(query.dtype) @ expanded_v
+            )
+
+        # Output projection
+        context = context.transpose(1, 2).contiguous()
+
+        context = context.reshape(
+            batch,
+            q_len,
+            Hq * d,
         )
 
-        # Numerically stable softmax
-        weights = torch.softmax(
-            scores.float(), dim=-1
-        ).to(query.dtype)
-
-        weights = self.dropout(weights)
-
-        # Attention output
-        output = weights @ value.unsqueeze(2) 
-
-        # Merge query groups into heads
-        output = output.reshape(
-            B, self.h, Tq, self.d_k
-        )
-
-        # (B, Tq, D)
-        output = output.transpose(1, 2).contiguous()
-        output = output.reshape(B, Tq, self.h * self.d_k)
-
-        output = self.W_o(output)
-
-        # Return per-query-head attention probabilities
-        weights = weights.reshape(B, self.h, Tq, Tk)
-
-        if use_cache:
-            return output, weights, (key, value)
-
-        return output, weights
+        return self.o_proj(context)

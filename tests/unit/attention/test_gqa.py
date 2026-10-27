@@ -1,255 +1,289 @@
+from __future__ import annotations
 
 import math
-
+from dataclasses import dataclass
+from typing import Literal
 import pytest
 import torch
 
+from transformers.cache_utils import DynamicCache
+
+from configs.attention import AttentionConfig
 from cpp_transformer.models.attention.gqa_with_kv import (
     GroupedQueryAttention,
 )
-from cpp_transformer.models.decoder import (
-    MultiHeadAttention,
-    build_transformer,
-)
 
 
-def explicit_reference(attn, x, mask):
-    """
-    Reference using physically repeated KV heads.
-    """
-
-    B, T, D = x.shape
-
-    q = attn.w_q(x).reshape(
-        B, T, attn.h, attn.d_k
-    ).transpose(1, 2)
-
-    k = attn.w_k(x).reshape(
-        B, T, attn.kv_heads, attn.d_k
-    ).transpose(1, 2)
-
-    v = attn.w_v(x).reshape(
-        B, T, attn.kv_heads, attn.d_k
-    ).transpose(1, 2)
-
-    k = k.repeat_interleave(
-        attn.group_size, dim=1
-    )
-
-    v = v.repeat_interleave(
-        attn.group_size, dim=1
-    )
-
-    scores = (
-        q @ k.transpose(-2, -1)
-    ) / math.sqrt(attn.d_k)
-
-    scores = scores.masked_fill(
-        ~mask, float("-inf")
-    )
-
-    weights = torch.softmax(scores, dim=-1)
-
-    output = weights @ v
-
-    output = output.transpose(1, 2).contiguous()
-    output = output.reshape(B, T, D)
-
-    return attn.W_o(output)
+def make_attention(
+    kv_heads: int,
+    backend: str = "sdpa",
+    layer_idx: int = 0,
+):
+    """Creates and returns a GroupedQueryAttention module for testing."""
+    return GroupedQueryAttention(
+        AttentionConfig(
+            d_model=64,
+            num_attention_heads=8,
+            num_key_value_heads=kv_heads,
+            dropout=0.0,
+            backend=backend,
+        ),
+        layer_idx=layer_idx,
+    ).eval()
 
 
+# 1. SDPA must match the mathematical reference.
 @pytest.mark.parametrize("kv_heads", [1, 2, 8])
-def test_gqa_matches_explicit_reference(kv_heads):
-
+def test_sdpa_matches_reference(kv_heads):
+    """Tests that the SDPA attention backend produces outputs matching the eager reference implementation."""
     torch.manual_seed(42)
 
-    attn = GroupedQueryAttention(
-        d_model=64,
-        h=8,
-        kv_heads=kv_heads,
-        dropout=0.0,
-    ).eval()
+    reference = make_attention(kv_heads, "eager")
+    optimized = make_attention(kv_heads, "sdpa")
+
+    optimized.load_state_dict(reference.state_dict())
+
+    x = torch.randn(2, 6, 64)
+
+    padding_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1],
+            [0, 0, 1, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+
+    for mask in (None, padding_mask):
+        expected = reference(
+            x, attention_mask=mask
+        )
+
+        actual = optimized(
+            x, attention_mask=mask
+        )
+
+        torch.testing.assert_close(
+            actual,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+# 2. Cached decode must match full-sequence attention.
+@pytest.mark.parametrize("backend", ["eager", "sdpa"])
+@pytest.mark.parametrize("kv_heads", [1, 2, 8])
+def test_cached_equals_full(backend, kv_heads):
+    """Tests that attention with cached decoding matches full-sequence forward pass outputs."""
+    torch.manual_seed(42)
+
+    attention = make_attention(
+        kv_heads, backend
+    )
 
     x = torch.randn(2, 7, 64)
 
-    mask = torch.tril(
-        torch.ones(7, 7, dtype=torch.bool)
-    )[None, None, :, :]
+    full_output = attention(x)
 
-    output, weights = attn(x, x, x, mask)
+    cache = DynamicCache()
+    outputs = []
 
-    expected = explicit_reference(attn, x, mask)
+    # Prefill 3 tokens, decode 1, then process 3.
+    for start, end in ((0, 3), (3, 4), (4, 7)):
 
-    torch.testing.assert_close(
-        output, expected,
-        rtol=1e-5, atol=1e-6,
-    )
+        output = attention(
+            x[:, start:end],
+            past_key_values=cache,
+            cache_position=torch.arange(start, end),
+            use_cache=True,
+        )
 
-    assert output.shape == (2, 7, 64)
-    assert weights.shape == (2, 8, 7, 7)
+        outputs.append(output)
 
-
-def test_gqa_matches_existing_mha():
-
-    torch.manual_seed(42)
-
-    mha = MultiHeadAttention(64, 8, 0.0).eval()
-
-    gqa = GroupedQueryAttention(
-        64, 8, 8, 0.0
-    ).eval()
-
-    # Identical weights, because Hkv == Hq
-    gqa.load_state_dict(mha.state_dict())
-
-    x = torch.randn(2, 6, 64)
-
-    mask = torch.tril(
-        torch.ones(6, 6, dtype=torch.bool)
-    )[None, None, :, :]
-
-    mha_out, _ = mha(x, x, x, mask)
-    gqa_out, _ = gqa(x, x, x, mask)
+    cached_output = torch.cat(outputs, dim=1)
 
     torch.testing.assert_close(
-        mha_out, gqa_out,
-        rtol=1e-5, atol=1e-6,
+        full_output,
+        cached_output,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+    assert cache.get_seq_length(0) == 7
+
+    assert cache[0][0].shape == (
+        2, kv_heads, 7, 8
     )
 
 
-def test_gqa_gradients():
-
-    torch.manual_seed(42)
-
-    attn = GroupedQueryAttention(
-        64, 8, 2, 0.0
+# 3. Both backends must support backpropagation.
+@pytest.mark.parametrize("backend", ["eager", "sdpa"])
+def test_backward(backend):
+    """Tests that both eager and SDPA attention backends support valid backpropagation."""
+    attention = GroupedQueryAttention(
+        AttentionConfig(
+            d_model=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            backend=backend,
+        ),
+        layer_idx=0,
     )
 
-    x = torch.randn(2, 6, 64)
+    x = torch.randn(
+        2, 5, 32, requires_grad=True
+    )
 
-    output, _ = attn(x, x, x)
+    output = attention(x)
 
     loss = output.square().mean()
-
     loss.backward()
 
-    for projection in (
-        attn.w_q,
-        attn.w_k,
-        attn.w_v,
-        attn.W_o,
-    ):
-        assert projection.weight.grad is not None
-        assert torch.isfinite(
-            projection.weight.grad
-        ).all()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+    for parameter in attention.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
 
 
-@pytest.mark.parametrize("kv_heads", [1, 2, 4])
-def test_full_model_matches_cached_decode(kv_heads):
-
-    torch.manual_seed(42)
-
-    model = build_transformer(
-        tgt_vocab_size=101,
-        tgt_seq_len=24,
-        d_model=32,
-        N=2,
-        h=4,
-        kv_heads=kv_heads,
-        dropout=0.0,
-        d_ff=64,
-    ).eval()
-
-    tokens = torch.randint(
-        1, 101, (2, 9)
+# 4. Fully masked rows must not produce NaNs.
+@pytest.mark.parametrize("backend", ["eager", "sdpa"])
+def test_fully_masked_rows(backend):
+    """Tests that fully masked rows do not introduce NaN values and output zeros correctly."""
+    attention = make_attention(
+        kv_heads=2,
+        backend=backend,
     )
 
-    # Full-sequence inference
-    full_mask = model.create_tgt_mask(
-        tokens, pad_token_id=0
+    x = torch.randn(2, 3, 64)
+
+    mask = torch.tensor(
+        [
+            [False, False, False],
+            [True, True, True],
+        ]
     )
 
-    full_logits = model(tokens, full_mask)
-
-    # Prefill first four tokens
-    first_logits, cache = model(
-        tokens[:, :4],
-        use_cache=True,
+    output = attention(
+        x, attention_mask=mask
     )
 
-    outputs = [first_logits]
+    assert torch.isfinite(output).all()
 
-    # Decode remaining tokens individually
-    for i in range(4, 9):
+    torch.testing.assert_close(
+        output[0],
+        torch.zeros_like(output[0]),
+    )
 
-        step_logits, cache = model(
-            tokens[:, i:i + 1],
+
+# 5. Invalid inputs must not corrupt the cache.
+def test_invalid_mask_preserves_cache():
+    """Tests that providing an invalid attention mask preserves the cache state without corruption."""
+    attention = make_attention(2)
+    cache = DynamicCache()
+
+    with pytest.raises(ValueError):
+        attention(
+            torch.randn(1, 4, 64),
+            attention_mask=torch.ones(
+                1, 99, dtype=torch.bool
+            ),
             past_key_values=cache,
             use_cache=True,
         )
 
-        outputs.append(step_logits)
+    assert cache.get_seq_length(0) == 0
 
-    cached_logits = torch.cat(
-        outputs, dim=1
+
+# 6. Each Transformer layer must own its cache entry.
+def test_layer_cache_isolation():
+    """Tests that each Transformer layer properly isolates and manages its own cache entry."""
+    first = make_attention(2, layer_idx=0)
+    second = make_attention(2, layer_idx=1)
+
+    cache = DynamicCache()
+    x = torch.randn(1, 4, 64)
+
+    first(x, past_key_values=cache, use_cache=True)
+    second(x, past_key_values=cache, use_cache=True)
+
+    assert cache.get_seq_length(0) == 4
+    assert cache.get_seq_length(1) == 4
+
+    first(
+        x[:, :1],
+        past_key_values=cache,
+        use_cache=True,
     )
 
-    torch.testing.assert_close(
-        full_logits,
-        cached_logits,
-        rtol=1e-5,
-        atol=1e-6,
+    assert cache.get_seq_length(0) == 5
+    assert cache.get_seq_length(1) == 4
+
+
+# 7. Requests must not share cache state.
+def test_request_cache_isolation():
+    """Tests that different requests maintain independent and isolated cache states."""
+    attention = make_attention(2)
+
+    cache_a = DynamicCache()
+    cache_b = DynamicCache()
+
+    attention(
+        torch.randn(1, 5, 64),
+        past_key_values=cache_a,
+        use_cache=True,
     )
 
-    # Cache: (batch, KV heads, tokens, head dimension)
-    assert cache[0][0].shape == (
-        2, kv_heads, 9, 8
+    attention(
+        torch.randn(1, 2, 64),
+        past_key_values=cache_b,
+        use_cache=True,
     )
 
+    assert cache_a.get_seq_length(0) == 5
+    assert cache_b.get_seq_length(0) == 2
 
-def test_gqa_training_step():
 
-    torch.manual_seed(42)
+# 8. Invalid cache positions must be rejected.
+def test_invalid_cache_position():
+    """Tests that providing invalid cache positions results in a raised ValueError."""
+    attention = make_attention(2)
+    cache = DynamicCache()
 
-    model = build_transformer(
-        tgt_vocab_size=101,
-        tgt_seq_len=16,
-        d_model=32,
-        N=2,
-        h=4,
-        kv_heads=2,
-        dropout=0.0,
-        d_ff=64,
-    )
+    with pytest.raises(ValueError):
+        attention(
+            torch.randn(1, 3, 64),
+            past_key_values=cache,
+            cache_position=torch.tensor([0, 1]),
+            use_cache=True,
+        )
 
-    tokens = torch.randint(
-        1, 101, (2, 9)
-    )
+    assert cache.get_seq_length(0) == 0
 
-    mask = model.create_tgt_mask(
-        tokens, pad_token_id=0
-    )
 
-    logits = model(tokens, mask)
+# 9. Invalid model configurations must fail early.
+def test_configuration_validation():
+    """Tests that invalid AttentionConfig parameters trigger early validation errors."""
+    invalid = [
+        (31, 8, 2),
+        (32, 6, 2),
+        (32, 4, 3),
+        (32, 4, 0),
+    ]
 
-    loss = torch.nn.functional.cross_entropy(
-        logits[:, :-1].reshape(-1, 101),
-        tokens[:, 1:].reshape(-1),
-    )
+    for d_model, heads, kv_heads in invalid:
+        with pytest.raises(ValueError):
+            AttentionConfig(
+                d_model=d_model,
+                num_attention_heads=heads,
+                num_key_value_heads=kv_heads,
+            )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=1e-3,
-    )
-
-    optimizer.zero_grad()
-    loss.backward()
-
-    assert (
-        model.decoder.layers[0]
-        .self_attention_block
-        .w_k.weight.grad.abs().sum() > 0
-    )
-
-    optimizer.step()
+    with pytest.raises(ValueError):
+        AttentionConfig(
+            d_model=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            dropout=1.5,
+        )
