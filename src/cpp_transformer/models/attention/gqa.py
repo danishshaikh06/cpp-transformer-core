@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.cache_utils import Cache, DynamicCache
 
-from configs.attention import AttentionConfig
+from cpp_transformer.configs.attention import AttentionConfig
 
 
 class GroupedQueryAttention(nn.Module):
@@ -160,18 +160,6 @@ class GroupedQueryAttention(nn.Module):
                 dtype=torch.long,
             )
 
-        expected_positions = torch.arange(
-            past_len,
-            kv_len,
-            device=hidden_states.device,
-            dtype=torch.long,
-        )
-
-        if not torch.equal(cache_position, expected_positions):
-            raise ValueError(
-                "cache_position must match the next contiguous cache positions"
-            )
-
         # Validate masks before cache mutation
         if attention_mask is not None:
 
@@ -271,13 +259,7 @@ class GroupedQueryAttention(nn.Module):
 
             # Native GQA acceleration is intended for CUDA.
             # Keep a portable non-CUDA fallback.
-
-            if Hq % Hkv != 0:
-                raise ValueError("Hq must be divisible by Hkv")
-
-            if self.config.group_size != Hq // Hkv:
-                raise ValueError("Incorrect GQA group_size")
-            
+    
             native_gqa = Hq != Hkv and query.is_cuda
 
             if Hq != Hkv and not native_gqa:

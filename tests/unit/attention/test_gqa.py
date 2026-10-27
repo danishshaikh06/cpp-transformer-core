@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
-from typing import Literal
 import pytest
 import torch
 
 from transformers.cache_utils import DynamicCache
 
-from configs.attention import AttentionConfig
+from cpp_transformer.configs.attention import AttentionConfig
 from cpp_transformer.models.attention.gqa_with_kv import (
     GroupedQueryAttention,
 )

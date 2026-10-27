@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 
 from cpp_transformer.core.paths import BEST_MODEL_FILE, TOKENIZER_FILE, TRAINING_CONFIG_FILE
-from cpp_transformer.models.educational_decoder import build_transformer
+from cpp_transformer.models.decoder import build_transformer
 from cpp_transformer.tokenization.bpe_tokenizer import BPETokenizer
 
 

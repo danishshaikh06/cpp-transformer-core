@@ -1,7 +1,12 @@
 import torch 
 from torch import nn
 import math
-from cpp_transformer.models.attention.gqa_with_kv import GroupedQueryAttention
+
+from transformers.cache_utils import Cache, DynamicCache
+
+from cpp_transformer.configs.attention import AttentionConfig
+from cpp_transformer.models.attention.gqa import GroupedQueryAttention
+from cpp_transformer.models.attention.mha import MultiHeadAttention
 
 
 class InputEmbedding(nn.Module):
@@ -78,56 +83,6 @@ class FeedForward(nn.Module):
         return self.linear_2(self.dropout(torch.relu(self.linear_1(x)))) # will it returns as [d_model, d_model]? Yes, because the first linear layer transforms from d_model to d_ff, and the second linear layer transforms back from d_ff to d_model. 
 
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self,d_model:int,h:int,dropout:float) -> None:
-        super().__init__()
-        self.d_model=d_model 
-        self.h=h
-        self.dropout=nn.Dropout(dropout) 
-        self.w_q=nn.Linear(d_model,d_model, bias=False) 
-        self.w_k=nn.Linear(d_model,d_model , bias= False) 
-        self.w_v=nn.Linear(d_model,d_model, bias = False) 
-        self.d_k=d_model//h 
-        self.W_o=nn.Linear(d_model,d_model, bias=False) # output weight matrix
-        assert d_model % h ==0, 'd_model must be divisible by h' # to make sure each head has equal dimension
-
-    @staticmethod 
-    def attention(query, key, value, mask, dropout: nn.Dropout):
-        d_k=query.shape[-1]
-        attention_scores= (query @ key.transpose(-2,-1)) / math.sqrt(d_k) # (batch_size, h, seq_len, d_k)
-        if mask is not None:
-            attention_scores= attention_scores.masked_fill(~mask, float('-inf')) # mask the future tokens
-        attention_weights= torch.softmax(attention_scores, dim=-1) # (batch_size, h, seq_len, seq_len)
-        if dropout is not None:
-            attention_weights= dropout(attention_weights)
-
-        weights= attention_weights @ value
-
-        return weights, attention_weights # (batch_size, h, seq_len, d_k), (batch_size, h, seq_len, seq_len)
-
-
-    def forward(self, q, k, v, mask):
-        query= self.w_q(q) 
-        key= self.w_k(k) 
-        value= self.w_v(v) 
-
-        # split the embedding into h heads(
-        query= query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1,2) # (batch_size, h, seq_len, d_k)
-        key= key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1,2) # (batch_size, h, seq_len, d_k)
-        value= value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1,2) # (batch_size, h, seq_len, d_k)
-        
-        # compute attention
-        x, attention_scores=MultiHeadAttention.attention(query, key, value, mask, self.dropout) 
-
-        # concatenate the heads
-        # (batch, h, seq_len, d_k) --> (batch, seq_len, h, d_k) --> (batch, seq_len, d_model)
-        x=x.transpose(1,2).contiguous() # (batch_size, seq_len, d_model) #contiguous is used to make sure that the tensor is stored in a contiguous chunk of memory 
-        
-        x = x.reshape(x.size(0), x.size(1), self.h * self.d_k)
-
-        # Multiply by W0
-        return self.W_o(x), attention_scores # (batch_size, seq_len, d_model), (batch_size, h, seq_len, seq_len) # w0-> output weight matrix 
-
 class ResidualConnection(nn.Module): 
     def __init__(self, d_model: int, dropout: float) -> None:
         super().__init__()  
@@ -137,122 +92,125 @@ class ResidualConnection(nn.Module):
     def forward(self, x, sublayer):
        return x + self.dropout(sublayer(self.norm(x)))
 
-class DecoderBlock(nn.Module):
 
-    def __init__(self, d_model: int, self_attention_block: MultiHeadAttention,feed_forward_block: FeedForward, dropout: float) -> None:
+class DecoderBlock(nn.Module):
+    """
+    Pre-norm decoder block.
+
+    Supports legacy MHA and the new configurable GQA module.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        self_attention_block: nn.Module,
+        feed_forward_block: nn.Module,
+        dropout: float,
+    ) -> None:
         super().__init__()
+
         self.self_attention_block = self_attention_block
         self.feed_forward_block = feed_forward_block
-        self.residual_connections = nn.ModuleList([ResidualConnection(d_model, dropout) for _ in range(2)]) # one for self-attention and one for feed-forward
+
+        self.residual_connections = nn.ModuleList(
+            [
+                ResidualConnection(d_model, dropout)
+                for _ in range(2)
+            ]
+        )
 
     def forward(
         self,
-        x,
-        tgt_mask=None,
-        past_key_value=None,
-        use_cache=False,
-    ):
-        if use_cache:
-            if not isinstance(
+        x: torch.Tensor,
+        tgt_mask: torch.Tensor | None = None,
+        *,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor:
+
+        def apply_attention(
+            hidden_states: torch.Tensor,
+        ) -> torch.Tensor:
+
+            if isinstance(
                 self.self_attention_block,
                 GroupedQueryAttention,
             ):
-                raise ValueError(
-                    "Cached decoding requires GroupedQueryAttention"
+                return self.self_attention_block(
+                    hidden_states,
+                    attention_mask=tgt_mask,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                    use_cache=use_cache,
                 )
 
-            residual = self.residual_connections[0]
-
-            normalized_x = residual.norm(x)
-
-            attention_output, _, present_kv = (
-                self.self_attention_block(
-                    normalized_x,
-                    normalized_x,
-                    normalized_x,
-                    tgt_mask,
-                    past_key_value=past_key_value,
-                    use_cache=True,
+            if use_cache:
+                raise NotImplementedError(
+                    "Legacy MHA does not support KV caching"
                 )
-            )
 
-            x = x + residual.dropout(attention_output)
+            # Existing MHA returns (output, weights).
+            return self.self_attention_block(
+                hidden_states,
+                hidden_states,
+                hidden_states,
+                tgt_mask,
+            )[0]
 
-        else:
-            x = self.residual_connections[0](
-                x,
-                lambda y: self.self_attention_block(
-                    y, y, y, tgt_mask
-                )[0],
-            )
+        x = self.residual_connections[0](
+            x,
+            apply_attention,
+        )
 
         x = self.residual_connections[1](
             x,
             self.feed_forward_block,
         )
 
-        if use_cache:
-            return x, present_kv
-
         return x
+
 
 
 class Decoder(nn.Module):
-    def __init__(self, layers: nn.ModuleList, features: int) -> None:
-        super().__init__() 
-        
-        # layers: a list of DecoderBlock modules stacked sequentially
-        # Example: [DecoderBlock1, DecoderBlock2, DecoderBlock3, ...]
-        self.layers = layers
-        self.norm = LayerNorm(features)  
+    """
+    Stack of Transformer decoder layers.
 
-    
+    One request-owned cache object is shared across
+    layers, but every layer updates a separate cache entry.
+    """
+
+    def __init__(
+        self,
+        layers: nn.ModuleList,
+        features: int,
+    ) -> None:
+        super().__init__()
+
+        self.layers = layers
+        self.norm = LayerNorm(features)
+
     def forward(
         self,
-        x,
-        tgt_mask=None,
-        past_key_values=None,
-        use_cache=False,
-    ):
+        x: torch.Tensor,
+        tgt_mask: torch.Tensor | None = None,
+        *,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor:
 
-        if (
-            past_key_values is not None
-            and len(past_key_values) != len(self.layers)
-        ):
-            raise ValueError(
-                "Expected one KV cache per decoder layer"
+        for layer in self.layers:
+            x = layer(
+                x,
+                tgt_mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                use_cache=use_cache,
             )
 
-        next_cache = []
+        return self.norm(x)
 
-        for i, layer in enumerate(self.layers):
-
-            if use_cache:
-
-                previous_cache = (
-                    None
-                    if past_key_values is None
-                    else past_key_values[i]
-                )
-
-                x, present = layer(
-                    x,
-                    tgt_mask,
-                    past_key_value=previous_cache,
-                    use_cache=True,
-                )
-
-                next_cache.append(present)
-
-            else:
-                x = layer(x, tgt_mask)
-
-        x = self.norm(x)
-
-        if use_cache:
-            return x, tuple(next_cache)
-
-        return x
 
 class ProjectionLayer(nn.Module):
     def __init__(self, d_model: int, vocab_size: int) -> None:
@@ -275,20 +233,20 @@ class Transformer(nn.Module):
         self.tgt_pos = tgt_pos
         self.projection_layer = projection_layer
 
-    
-    
     def decode(
         self,
-        tgt,
-        tgt_mask=None,
-        past_key_values=None,
-        use_cache=False,
-    ):
+        tgt: torch.Tensor,
+        tgt_mask: torch.Tensor | None = None,
+        *,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor:
 
         start_pos = (
-            0
-            if past_key_values is None
-            else past_key_values[0][0].shape[-2]
+            past_key_values.get_seq_length(0)
+            if past_key_values is not None
+            else 0
         )
 
         x = self.tgt_embed(tgt)
@@ -302,6 +260,7 @@ class Transformer(nn.Module):
             x,
             tgt_mask,
             past_key_values=past_key_values,
+            cache_position=cache_position,
             use_cache=use_cache,
         )
     
@@ -323,35 +282,95 @@ class Transformer(nn.Module):
     
     def forward(
         self,
-        tgt,
-        tgt_mask=None,
-        past_key_values=None,
-        use_cache=False,
-    ):
+        tgt: torch.Tensor,
+        tgt_mask: torch.Tensor | None = None,
+        *,
+        past_key_values: Cache | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, Cache]:
+        """
+            Full-sequence training or cached autoregressive inference.
 
-        if past_key_values is not None and not use_cache:
+            Without cache:
+                Returns logits (B, T, vocab_size).
+
+            With cache:
+                Returns (logits, updated_cache).
+        """
+
+        if tgt.ndim != 2 or tgt.dtype != torch.long:
             raise ValueError(
-                "Set use_cache=True when supplying past_key_values"
+                "tgt must be a LongTensor of shape (B, T)"
+            )
+
+        if tgt.shape[0] == 0 or tgt.shape[1] == 0:
+            raise ValueError("Empty token batches are unsupported")
+
+        if not use_cache and past_key_values is not None:
+            raise ValueError(
+                "Cannot supply past_key_values "
+                "when use_cache=False"
             )
 
         if use_cache:
+            if past_key_values is None:
+                past_key_values = DynamicCache()
 
-            hidden, present = self.decode(
-                tgt,
-                tgt_mask,
-                past_key_values=past_key_values,
-                use_cache=True,
+            if not isinstance(past_key_values, DynamicCache):
+                raise NotImplementedError(
+                    "Only DynamicCache is supported currently"
+                )
+
+            # Catch partially updated or inconsistent caches.
+            start_pos = past_key_values.get_seq_length(0)
+
+            for layer_idx in range(len(self.decoder.layers)):
+                if (
+                    past_key_values.get_seq_length(layer_idx)
+                    != start_pos
+                ):
+                    raise RuntimeError(
+                        "Inconsistent KV-cache sequence lengths "
+                        "across decoder layers"
+                    )
+
+            cache_position = torch.arange(
+                start_pos,
+                start_pos + tgt.shape[1],
+                device=tgt.device,
+                dtype=torch.long,
             )
 
-            logits = self.project(hidden)
+        else:
+            cache_position = None
 
-            return logits, present
+        hidden_states = self.decode(
+            tgt,
+            tgt_mask,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            use_cache=use_cache,
+        )
 
-        hidden = self.decode(tgt, tgt_mask)
+        logits = self.project(hidden_states)
 
-        return self.project(hidden)
+        if use_cache:
+            return logits, past_key_values
 
-def build_transformer(tgt_vocab_size: int, tgt_seq_len: int, d_model: int, N: int, h: int, dropout: float, d_ff: int=2048, kv_heads: int | None = None,) -> Transformer:
+        return logits
+
+
+def build_transformer(
+        tgt_vocab_size: int, 
+        tgt_seq_len: int, 
+        d_model: int, 
+        N: int, 
+        h: int, 
+        dropout: float, 
+        d_ff: int=2048, 
+        kv_heads: int | None = None,
+        attention_backend: str = "sdpa",
+        ) -> Transformer:
     # Create the embedding layers
     tgt_embed = InputEmbedding(tgt_vocab_size, d_model)
 
@@ -361,26 +380,52 @@ def build_transformer(tgt_vocab_size: int, tgt_seq_len: int, d_model: int, N: in
 
     # Create the decoder blocks
     decoder_blocks = []
-    for _ in range(N):
-        if kv_heads is None:
-            # Preserve original MHA architecture
-            decoder_self_attention_block = MultiHeadAttention(
-                d_model, h, dropout
+
+    if N <= 0:
+        raise ValueError("N must be positive")
+
+    attention_config = None
+
+    if kv_heads is not None:
+        attention_config = AttentionConfig(
+            d_model=d_model,
+            num_attention_heads=h,
+            num_key_value_heads=kv_heads,
+            dropout=dropout,
+            backend=attention_backend,
+        )
+
+    for layer_idx in range(N):
+
+        if attention_config is None:
+            # Preserve old MHA for legacy checkpoints.
+            attention = MultiHeadAttention(
+                d_model,
+                h,
+                dropout,
             )
         else:
-            # MHA / GQA / MQA via shared implementation
-            decoder_self_attention_block = GroupedQueryAttention(
-                d_model=d_model,
-                h=h,
-                kv_heads=kv_heads,
-                dropout=dropout,
+            attention = GroupedQueryAttention(
+                attention_config,
+                layer_idx=layer_idx,
             )
-            
-        feed_forward_block = FeedForward(d_model, d_ff, dropout)
-        decoder_block = DecoderBlock(d_model, decoder_self_attention_block, feed_forward_block, dropout)
-        decoder_blocks.append(decoder_block)
+
+        ffn = FeedForward(
+            d_model,
+            d_ff,
+            dropout,
+        )
+
+        decoder_blocks.append(
+            DecoderBlock(
+                d_model,
+                attention,
+                ffn,
+                dropout,
+            )
+        )
     
-    # Create the encoder and decoder
+    # Create the decoder
     decoder = Decoder(nn.ModuleList(decoder_blocks), d_model)
 
     # Create the projection layer
