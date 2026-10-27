@@ -128,9 +128,7 @@ class DecoderBlock(nn.Module):
         *,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
-        position_embeddings: tuple[
-            torch.Tensor, torch.Tensor
-        ] | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor:
 
@@ -202,9 +200,7 @@ class Decoder(nn.Module):
         *,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
-        position_embeddings: tuple[
-            torch.Tensor, torch.Tensor
-        ] | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor:
 
@@ -255,6 +251,7 @@ class Transformer(nn.Module):
         self.projection_layer = projection_layer
         self.rotary_emb = rotary_emb
     
+    
     def decode(
         self,
         tgt: torch.Tensor,
@@ -265,53 +262,50 @@ class Transformer(nn.Module):
         use_cache: bool = False,
     ) -> torch.Tensor:
 
-        start_pos = (
-            past_key_values.get_seq_length(0)
-            if past_key_values is not None
-            else 0
+        past_len = (
+            0
+            if past_key_values is None
+            else past_key_values.get_seq_length(0)
         )
 
-        x = self.tgt_embed(tgt)
+        hidden_states = self.tgt_embed(tgt)
+
+        if cache_position is None:
+            cache_position = torch.arange(
+                past_len,
+                past_len + tgt.shape[1],
+                device=tgt.device,
+                dtype=torch.long,
+            )
 
         if self.rotary_emb is not None:
 
-            positions = cache_position
-
-            if positions is None:
-                positions = torch.arange(
-                    start_pos,
-                    start_pos + tgt.size(1),
-                    device=tgt.device,
-                    dtype=torch.long,
-                )
-
-            position_embeddings = self.rotary_emb(
-                positions,
-                dtype=x.dtype,
+            # Compute cos/sin once for the entire model forward.
+            cos, sin = self.rotary_emb(
+                hidden_states,
+                position_ids=cache_position,
             )
 
-        else:
-            # Backward-compatible sinusoidal encoding.
-            if self.tgt_pos is None:
-                raise RuntimeError(
-                    "Positional encoding is not initialized"
-                )
+            position_embeddings = (cos, sin)
 
-            x = self.tgt_pos(
-                x,
-                start_pos=start_pos,
+        else:
+            # Legacy sinusoidal positional encoding.
+            hidden_states = self.tgt_pos(
+                hidden_states,
+                start_pos=past_len,
             )
 
             position_embeddings = None
 
         return self.decoder(
-            x,
+            hidden_states,
             tgt_mask,
             past_key_values=past_key_values,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
             use_cache=use_cache,
         )
+
 
     
     @staticmethod
@@ -410,58 +404,31 @@ class Transformer(nn.Module):
         return logits
 
 
+
 def build_transformer(
-        tgt_vocab_size: int, 
-        tgt_seq_len: int, 
-        d_model: int, 
-        N: int, 
-        h: int, 
-        dropout: float, 
-        d_ff: int=2048, 
-        kv_heads: int | None = None,
-        attention_backend: str = "sdpa",
-        position_encoding: str = "sinusoidal",
-        rope_theta: float = 10000.0,
-        ) -> Transformer:
-    
-    # Create the embedding layers
-    tgt_embed = InputEmbedding(tgt_vocab_size, d_model)
+    tgt_vocab_size: int,
+    tgt_seq_len: int,
+    d_model: int,
+    N: int,
+    h: int,
+    dropout: float,
+    d_ff: int = 2048,
+    kv_heads: int | None = None,
+    attention_backend: str = "sdpa",
+    position_encoding: str = "sinusoidal",
+    rope_theta: float = 10000.0,
+    rotary_dim: int | None = None,
+) -> Transformer:
+
+    if N <= 0:
+        raise ValueError("N must be positive")
 
     if position_encoding not in ("sinusoidal", "rope"):
         raise ValueError(
             "position_encoding must be 'sinusoidal' or 'rope'"
         )
-    
-    if position_encoding == "rope":
 
-        if kv_heads is None:
-            raise ValueError(
-                "RoPE requires the configurable GQA attention module"
-            )
-
-        # No additive positional encoding when using RoPE.
-        tgt_pos = None
-
-        rotary_emb = RotaryEmbedding(
-            head_dim=d_model // h,
-            theta=rope_theta,
-        )
-
-    else:
-        tgt_pos = PositionalEncoding(
-            d_model,
-            tgt_seq_len,
-            dropout,
-        )
-
-        rotary_emb = None
-
-    # Create the decoder blocks
-    decoder_blocks = []
-
-    if N <= 0:
-        raise ValueError("N must be positive")
-
+    # Validate attention configuration first.
     attention_config = None
 
     if kv_heads is not None:
@@ -473,22 +440,61 @@ def build_transformer(
             backend=attention_backend,
         )
 
+    if position_encoding == "rope" and attention_config is None:
+        raise ValueError(
+            "RoPE requires the configurable GQA module"
+        )
+
+    tgt_embed = InputEmbedding(
+        tgt_vocab_size,
+        d_model,
+    )
+
+    if position_encoding == "rope":
+
+        tgt_pos = None
+
+        rotary_emb = RotaryEmbedding(
+            head_dim=attention_config.head_dim,
+            theta=rope_theta,
+            rotary_dim=rotary_dim,
+        )
+
+    else:
+
+        if rotary_dim is not None:
+            raise ValueError(
+                "rotary_dim is only valid with RoPE"
+            )
+
+        tgt_pos = PositionalEncoding(
+            d_model,
+            tgt_seq_len,
+            dropout,
+        )
+
+        rotary_emb = None
+
+    decoder_blocks = []
+
     for layer_idx in range(N):
 
         if attention_config is None:
-            # Preserve old MHA for legacy checkpoints.
+
             attention = MultiHeadAttention(
                 d_model,
                 h,
                 dropout,
             )
+
         else:
+
             attention = GroupedQueryAttention(
                 attention_config,
                 layer_idx=layer_idx,
             )
 
-        ffn = FeedForward(
+        feed_forward = FeedForward(
             d_model,
             d_ff,
             dropout,
@@ -498,27 +504,37 @@ def build_transformer(
             DecoderBlock(
                 d_model,
                 attention,
-                ffn,
+                feed_forward,
                 dropout,
             )
         )
-    
-    # Create the decoder
-    decoder = Decoder(nn.ModuleList(decoder_blocks), d_model)
 
-    # Create the projection layer
-    projection_layer = ProjectionLayer(d_model, tgt_vocab_size)
-    
-    # Create the transformer
-    transformer = Transformer( 
-        decoder=decoder, tgt_embed=tgt_embed,tgt_pos=tgt_pos, projection_layer= projection_layer, rotary_emb=rotary_emb,)
-    transformer.projection_layer.proj.weight = transformer.tgt_embed.embedding.weight # weight tying between input embedding and output projection layer 
-    
-    # Initialize the parameters
-    for p in transformer.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_uniform_(p)
-    
+    decoder = Decoder(
+        nn.ModuleList(decoder_blocks),
+        d_model,
+    )
+
+    projection_layer = ProjectionLayer(
+        d_model,
+        tgt_vocab_size,
+    )
+
+    transformer = Transformer(
+        decoder=decoder,
+        tgt_embed=tgt_embed,
+        tgt_pos=tgt_pos,
+        projection_layer=projection_layer,
+        rotary_emb=rotary_emb,
+    )
+
+    # Tie embedding and LM-head weights.
+    transformer.projection_layer.proj.weight = (
+        transformer.tgt_embed.embedding.weight
+    )
+
+    # Preserve your existing initialization strategy.
+    for parameter in transformer.parameters():
+        if parameter.dim() > 1:
+            nn.init.xavier_uniform_(parameter)
+
     return transformer
-
-    

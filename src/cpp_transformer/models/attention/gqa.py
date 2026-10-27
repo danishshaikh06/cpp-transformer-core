@@ -9,6 +9,7 @@ from torch import nn
 from transformers.cache_utils import Cache, DynamicCache
 
 from cpp_transformer.configs.attention import AttentionConfig
+from cpp_transformer.models.attention.rope import apply_rotary_pos_emb
 
 
 class GroupedQueryAttention(nn.Module):
@@ -61,6 +62,7 @@ class GroupedQueryAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor:
         """

@@ -11,7 +11,11 @@
     "heads": 8,
     "dropout": 0.1,
     "d_ff": 1024,
-    "kv_heads": 2
+    "kv_heads": 2,
+    "position_encoding": "rope",
+    "rope_theta": 10000.0,
+    "rotary_dim": null,
+    "attention_backend": "sdpa"
   },
   "cuda": {
     "seq_len": 256,
@@ -25,7 +29,11 @@
     "heads": 8,
     "dropout": 0.1,
     "d_ff": 1536,
-    "kv_heads": 2
+    "kv_heads": 2,
+    "position_encoding": "rope",
+    "rope_theta": 10000.0,
+    "rotary_dim": null,
+    "attention_backend": "sdpa"
   },
   "special_tokens": {"pad_id": 3000, "bos_id": 3001, "eos_id": 3002}
 }
