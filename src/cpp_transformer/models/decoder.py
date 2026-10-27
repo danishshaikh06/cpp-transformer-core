@@ -7,6 +7,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from cpp_transformer.configs.attention import AttentionConfig
 from cpp_transformer.models.attention.gqa import GroupedQueryAttention
 from cpp_transformer.models.attention.mha import MultiHeadAttention
+from cpp_transformer.models.attention.rope import RotaryEmbedding
 
 
 class InputEmbedding(nn.Module):
@@ -119,6 +120,7 @@ class DecoderBlock(nn.Module):
             ]
         )
 
+    
     def forward(
         self,
         x: torch.Tensor,
@@ -126,6 +128,9 @@ class DecoderBlock(nn.Module):
         *,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[
+            torch.Tensor, torch.Tensor
+        ] | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor:
 
@@ -142,6 +147,7 @@ class DecoderBlock(nn.Module):
                     attention_mask=tgt_mask,
                     past_key_values=past_key_values,
                     cache_position=cache_position,
+                    position_embeddings=position_embeddings,
                     use_cache=use_cache,
                 )
 
@@ -150,7 +156,6 @@ class DecoderBlock(nn.Module):
                     "Legacy MHA does not support KV caching"
                 )
 
-            # Existing MHA returns (output, weights).
             return self.self_attention_block(
                 hidden_states,
                 hidden_states,
@@ -171,7 +176,6 @@ class DecoderBlock(nn.Module):
         return x
 
 
-
 class Decoder(nn.Module):
     """
     Stack of Transformer decoder layers.
@@ -190,6 +194,7 @@ class Decoder(nn.Module):
         self.layers = layers
         self.norm = LayerNorm(features)
 
+    
     def forward(
         self,
         x: torch.Tensor,
@@ -197,6 +202,9 @@ class Decoder(nn.Module):
         *,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[
+            torch.Tensor, torch.Tensor
+        ] | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor:
 
@@ -206,11 +214,11 @@ class Decoder(nn.Module):
                 tgt_mask,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
+                position_embeddings=position_embeddings,
                 use_cache=use_cache,
             )
 
         return self.norm(x)
-
 
 class ProjectionLayer(nn.Module):
     def __init__(self, d_model: int, vocab_size: int) -> None:
@@ -226,13 +234,27 @@ class ProjectionLayer(nn.Module):
 
 class Transformer(nn.Module):
 
-    def __init__(self, decoder: Decoder, tgt_embed: InputEmbedding, tgt_pos: PositionalEncoding, projection_layer: ProjectionLayer) -> None:
+    def __init__(
+            self, 
+            decoder: Decoder, 
+            tgt_embed: InputEmbedding, 
+            tgt_pos: PositionalEncoding | None, 
+            projection_layer: ProjectionLayer,
+            rotary_emb: RotaryEmbedding | None = None,
+        ) -> None:
         super().__init__()
+
+        if (tgt_pos is None) == (rotary_emb is None):
+            raise ValueError(
+                "Exactly one positional encoding method is required"
+            )
+        
         self.decoder = decoder
         self.tgt_embed = tgt_embed
         self.tgt_pos = tgt_pos
         self.projection_layer = projection_layer
-
+        self.rotary_emb = rotary_emb
+    
     def decode(
         self,
         tgt: torch.Tensor,
@@ -251,18 +273,46 @@ class Transformer(nn.Module):
 
         x = self.tgt_embed(tgt)
 
-        x = self.tgt_pos(
-            x,
-            start_pos=start_pos,
-        )
+        if self.rotary_emb is not None:
+
+            positions = cache_position
+
+            if positions is None:
+                positions = torch.arange(
+                    start_pos,
+                    start_pos + tgt.size(1),
+                    device=tgt.device,
+                    dtype=torch.long,
+                )
+
+            position_embeddings = self.rotary_emb(
+                positions,
+                dtype=x.dtype,
+            )
+
+        else:
+            # Backward-compatible sinusoidal encoding.
+            if self.tgt_pos is None:
+                raise RuntimeError(
+                    "Positional encoding is not initialized"
+                )
+
+            x = self.tgt_pos(
+                x,
+                start_pos=start_pos,
+            )
+
+            position_embeddings = None
 
         return self.decoder(
             x,
             tgt_mask,
             past_key_values=past_key_values,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
             use_cache=use_cache,
         )
+
     
     @staticmethod
     def create_tgt_mask(tgt, pad_token_id):
@@ -370,13 +420,41 @@ def build_transformer(
         d_ff: int=2048, 
         kv_heads: int | None = None,
         attention_backend: str = "sdpa",
+        position_encoding: str = "sinusoidal",
+        rope_theta: float = 10000.0,
         ) -> Transformer:
+    
     # Create the embedding layers
     tgt_embed = InputEmbedding(tgt_vocab_size, d_model)
 
-    # Create the positional encoding layers
-    tgt_pos = PositionalEncoding(d_model, tgt_seq_len, dropout)
+    if position_encoding not in ("sinusoidal", "rope"):
+        raise ValueError(
+            "position_encoding must be 'sinusoidal' or 'rope'"
+        )
     
+    if position_encoding == "rope":
+
+        if kv_heads is None:
+            raise ValueError(
+                "RoPE requires the configurable GQA attention module"
+            )
+
+        # No additive positional encoding when using RoPE.
+        tgt_pos = None
+
+        rotary_emb = RotaryEmbedding(
+            head_dim=d_model // h,
+            theta=rope_theta,
+        )
+
+    else:
+        tgt_pos = PositionalEncoding(
+            d_model,
+            tgt_seq_len,
+            dropout,
+        )
+
+        rotary_emb = None
 
     # Create the decoder blocks
     decoder_blocks = []
@@ -432,7 +510,8 @@ def build_transformer(
     projection_layer = ProjectionLayer(d_model, tgt_vocab_size)
     
     # Create the transformer
-    transformer = Transformer( decoder, tgt_embed,tgt_pos, projection_layer)
+    transformer = Transformer( 
+        decoder=decoder, tgt_embed=tgt_embed,tgt_pos=tgt_pos, projection_layer= projection_layer, rotary_emb=rotary_emb,)
     transformer.projection_layer.proj.weight = transformer.tgt_embed.embedding.weight # weight tying between input embedding and output projection layer 
     
     # Initialize the parameters
