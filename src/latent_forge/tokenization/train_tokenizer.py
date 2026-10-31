@@ -1,5 +1,5 @@
-from cpp_transformer.core.paths import PROCESSED_DATA_DIR
-from cpp_transformer.tokenization.bpe_tokenizer import BPETokenizer
+from latent_forge.core.paths import PROCESSED_DATA_DIR
+from latent_forge.tokenization.bpe_tokenizer import BPETokenizer
 
 
 def main() -> None:

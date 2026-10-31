@@ -4,10 +4,10 @@ import math
 
 from transformers.cache_utils import Cache, DynamicCache
 
-from cpp_transformer.configs.attention import AttentionConfig
-from cpp_transformer.models.attention.gqa import GroupedQueryAttention
-from cpp_transformer.models.attention.mha import MultiHeadAttention
-from cpp_transformer.models.attention.rope import RotaryEmbedding
+from latent_forge.configs.attention import AttentionConfig
+from latent_forge.models.attention.gqa import GroupedQueryAttention
+from latent_forge.models.attention.mha import MultiHeadAttention
+from latent_forge.models.attention.rope import RotaryEmbedding
 
 
 class InputEmbedding(nn.Module):

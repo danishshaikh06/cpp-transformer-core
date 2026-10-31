@@ -1,4 +1,4 @@
-from cpp_transformer.tokenization.bpe_tokenizer import BPETokenizer
+from latent_forge.tokenization.bpe_tokenizer import BPETokenizer
 
 
 def test_bpe_tokenizer_round_trip() -> None:

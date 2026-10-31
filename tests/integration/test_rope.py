@@ -3,7 +3,7 @@ import pytest
 import torch
 from transformers.cache_utils import DynamicCache
 
-from cpp_transformer.models.decoder import build_transformer
+from latent_forge.models.decoder import build_transformer
 
 
 def create_model(

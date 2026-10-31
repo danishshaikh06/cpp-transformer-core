@@ -8,14 +8,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from cpp_transformer.core.paths import (
+from latent_forge.core.paths import (
     ARTIFACTS_DIR,
     BEST_MODEL_FILE,
     PROCESSED_DATA_DIR,
     TRAINING_CONFIG_FILE,
 )
-from cpp_transformer.models.educational_decoder import build_transformer
-from cpp_transformer.training.inference import generate_completion, load_tokenizer
+from latent_forge.models.educational_decoder import build_transformer
+from latent_forge.training.inference import generate_completion, load_tokenizer
 
 
 DEFAULT_DATASET = PROCESSED_DATA_DIR / "fine_tuning_dataset.txt"

@@ -2,8 +2,8 @@ import pytest
 import torch
 from transformers.cache_utils import DynamicCache
 
-from cpp_transformer.configs.mla import MLAConfig
-from cpp_transformer.models.attention.mla import MultiHeadLatentAttention
+from latent_forge.configs.mla import MLAConfig
+from latent_forge.models.attention.mla import MultiHeadLatentAttention
 
 
 def make_module(mode="naive", q_lora_rank=32, layer_idx=0):

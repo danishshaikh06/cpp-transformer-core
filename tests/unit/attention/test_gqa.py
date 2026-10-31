@@ -5,8 +5,8 @@ import torch
 
 from transformers.cache_utils import DynamicCache
 
-from cpp_transformer.configs.attention import AttentionConfig
-from cpp_transformer.models.attention.gqa import (
+from latent_forge.configs.attention import AttentionConfig
+from latent_forge.models.attention.gqa import (
     GroupedQueryAttention,
 )
 

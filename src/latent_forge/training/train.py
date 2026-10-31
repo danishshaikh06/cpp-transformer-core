@@ -8,15 +8,15 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from cpp_transformer.core.paths import (
+from latent_forge.core.paths import (
     CONFIGS_DIR,
     BEST_MODEL_FILE,
     TOKENS_WITH_SPECIAL_FILE,
     TRAINING_CONFIG_FILE,
     ensure_artifacts_dir,
 )
-from cpp_transformer.models.decoder import build_transformer
-from cpp_transformer.training.inference import generate_completion, load_tokenizer
+from latent_forge.models.decoder import build_transformer
+from latent_forge.training.inference import generate_completion, load_tokenizer
 
 
 with (CONFIGS_DIR / "training.json").open(encoding="utf-8") as config_file:

@@ -4,7 +4,7 @@ import json
 
 import numpy as np
 
-from cpp_transformer.core.paths import CONFIGS_DIR, PROCESSED_DATA_DIR
+from latent_forge.core.paths import CONFIGS_DIR, PROCESSED_DATA_DIR
 
 
 def load_special_token_ids() -> dict[str, int]:

@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.cache_utils import Cache, DynamicCache
 
-from cpp_transformer.configs.attention import AttentionConfig
-from cpp_transformer.models.attention.rope import apply_rotary_pos_emb
+from latent_forge.configs.attention import AttentionConfig
+from latent_forge.models.attention.rope import apply_rotary_pos_emb
 
 
 class GroupedQueryAttention(nn.Module):

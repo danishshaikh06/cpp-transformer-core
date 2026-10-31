@@ -13,8 +13,8 @@ from torch import nn
 from torch.nn import functional as F
 from transformers.cache_utils import Cache, DynamicCache
 
-from cpp_transformer.configs.mla import MLAConfig
-from cpp_transformer.models.attention.rope import RotaryEmbedding, apply_rotary_pos_emb
+from latent_forge.configs.mla import MLAConfig
+from latent_forge.models.attention.rope import RotaryEmbedding, apply_rotary_pos_emb
 
 
 class MultiHeadLatentAttention(nn.Module):
