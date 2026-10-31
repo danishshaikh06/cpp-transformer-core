@@ -6,7 +6,7 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 from cpp_transformer.configs.attention import AttentionConfig
-from cpp_transformer.models.attention.gqa_with_kv import (
+from cpp_transformer.models.attention.gqa import (
     GroupedQueryAttention,
 )
 

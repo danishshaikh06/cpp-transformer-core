@@ -65,7 +65,7 @@ class GroupedQueryAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor:
-        """
+        """ 
         Args:
             hidden_states:
                 (batch, new_tokens, d_model)
@@ -214,6 +214,16 @@ class GroupedQueryAttention(nn.Module):
         value = value.reshape(
             batch, q_len, Hkv, d
         ).transpose(1, 2)
+
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+
+            query, key = apply_rotary_pos_emb(
+                query,
+                key,
+                cos,
+                sin,
+            )
 
         # KV cache update
         if past_key_values is not None:
